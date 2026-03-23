@@ -117,10 +117,10 @@ ROR_DEBUG=1 ror -i curl
 ## File Structure
 
 ```
-/var/ror/
+/etc/ror/
 ├── ror.conf            # config
 ├── installed.json      # installed package database
-└── packages/
+/var/ror/packages/
     ├── groups/         # group definitions
     └── <category>/
         └── <pkg>/
