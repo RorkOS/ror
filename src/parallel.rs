@@ -4,7 +4,7 @@ use std::thread;
 use crate::config::Config;
 use crate::install::{self, Dependency, InstalledDB, load_package};
 use colored::Colorize;
-use crate::debug; 
+use crate::debug;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -66,10 +66,19 @@ impl DependencyGraph {
             }
         }
 
-        if in_degree.values().any(|&d| d > 0) {
-            eprintln!("{} Circular dependency detected!", "[ror]".red().bold());
-            debug!("compute_levels: circular dependency detected");
+        let cyclic: Vec<_> = in_degree.iter()
+            .filter(|(_, &d)| d > 0)
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        if !cyclic.is_empty() {
+            eprintln!(
+                "{} Warning: cycle detected among packages, they will be installed in arbitrary order",
+                "[ror]".yellow().bold()
+            );
+            debug!("compute_levels: circular dependency among: {:?}", cyclic);
         }
+
         debug!("compute_levels: levels count = {}", levels.len());
         levels
     }
@@ -239,6 +248,7 @@ fn install_single_package(pkg_name: &str, cfg: Arc<Config>, db_mutex: &Mutex<Ins
     println!("{} Package registered in database", "[ror]".green());
     Ok(())
 }
+
 pub fn install_packages_parallel(packages: &[String], cfg: Arc<Config>) -> Result<()> {
     debug!("install_packages_parallel: called with {:?}", packages);
     let installed_db = InstalledDB::load();
@@ -253,20 +263,38 @@ pub fn install_packages_parallel(packages: &[String], cfg: Arc<Config>) -> Resul
 
     let graph = build_graph(&required, &installed_db)?;
     let mut levels = graph.compute_levels();
-    
+
     if levels.is_empty() && !required.is_empty() {
         debug!("install_packages_parallel: no dependencies, creating single level");
         levels.push(required.iter().cloned().collect());
     }
-    
+
     debug!("install_packages_parallel: levels: {:?}", levels);
+
+    let total_pkgs: usize = levels.iter().map(|l| l.len()).sum();
+    let mut installed_count = 0usize;
+
+    println!(
+        "{} Installing {} package(s) across {} level(s)",
+        "[ror]".blue().bold(),
+        total_pkgs,
+        levels.len()
+    );
 
     let db_mutex = Arc::new(Mutex::new(InstalledDB::load()));
 
     for (level_idx, level_pkgs) in levels.into_iter().enumerate() {
-        println!("{} Level {}: {} packages", ">>>".cyan(), level_idx, level_pkgs.len());
+        println!(
+            "{} Level {}: {} package(s)",
+            ">>>".cyan(),
+            level_idx,
+            level_pkgs.len()
+        );
         debug!("install_packages_parallel: starting level {} with {:?}", level_idx, level_pkgs);
+
+        let level_total = level_pkgs.len();
         let mut handles = Vec::new();
+
         for pkg in level_pkgs {
             let pkg_name = pkg.clone();
             let cfg = Arc::clone(&cfg);
@@ -274,13 +302,27 @@ pub fn install_packages_parallel(packages: &[String], cfg: Arc<Config>) -> Resul
             let handle = thread::spawn(move || {
                 install_single_package(&pkg_name, cfg, &db_mutex)
             });
-            handles.push(handle);
+            handles.push((pkg, handle));
         }
 
         let mut errors = Vec::new();
-        for handle in handles {
+        let mut level_done = 0usize;
+
+        for (pkg_name, handle) in handles {
             match handle.join() {
-                Ok(Ok(())) => {},
+                Ok(Ok(())) => {
+                    installed_count += 1;
+                    level_done += 1;
+                    eprint!(
+                        "\r\x1b[K\x1b[36m[{:>3}/{:<3}]\x1b[0m  level {}, total {}/{}  {}",
+                        level_done, level_total,
+                        level_idx,
+                        installed_count, total_pkgs,
+                        pkg_name
+                    );
+                    use std::io::Write;
+                    std::io::stderr().flush().ok();
+                }
                 Ok(Err(e)) => {
                     debug!("install_packages_parallel: thread error: {}", e);
                     errors.push(e);
@@ -291,6 +333,7 @@ pub fn install_packages_parallel(packages: &[String], cfg: Arc<Config>) -> Resul
                 }
             }
         }
+        eprintln!();
 
         if !errors.is_empty() {
             eprintln!("{} Errors during level {}: {:?}", "[ror]".red().bold(), level_idx, errors);

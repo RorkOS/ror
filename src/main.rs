@@ -12,65 +12,66 @@ mod delete;
 mod listinstalled;
 mod update;
 mod rootfs;
-mod parallel;  
+mod parallel;
 mod debug;
 mod search;
 mod repo;
+mod progress;
 
 #[derive(Parser, Debug)]
 #[command(author, about, arg_required_else_help = true)]
 struct Args {
     #[arg(long = "search", value_name = "QUERY")]
     search: Option<String>,
-    
+
     #[arg(short = 's', long = "sync")]
     sync: bool,
-    
+
     #[arg(short = 'd', long = "delete", value_name = "PACKAGE")]
     delete: Option<String>,
-    
+
     #[arg(short = 'l', long = "list-installed")]
     listinstalled: bool,
-    
+
     #[arg(long = "info", value_name = "PACKAGE")]
     info: Option<String>,
-    
+
     #[arg(short = 'v', long = "version")]
     version: bool,
-    
+
     #[arg(short = 'g', long = "gen-config")]
     gen_config: bool,
-    
+
     #[arg(short = 'i', long = "install", value_name = "PACKAGE_OR_GROUP", num_args = 1..)]
     install: Vec<String>,
-    
+
     #[arg(long = "update", value_name = "PACKAGE")]
     update: Option<String>,
-    
+
     #[arg(long = "dry-run")]
     dry_run: bool,
-    
+
     #[arg(short = 'u', long = "upgrade")]
     upgrade: bool,
-    
+
     #[arg(long = "repo-add", value_names = ["NAME", "URL"])]
     repo_add: Option<Vec<String>>,
-    
+
     #[arg(long = "repo-remove", value_name = "NAME")]
     repo_remove: Option<String>,
-    
+
     #[arg(long = "repo-list")]
     repo_list: bool,
-    
+
     #[arg(long = "build-rootfs")]
     build_rootfs: bool,
-    
+
     #[arg(long = "rootfs-group", value_name = "GROUP")]
     rootfs_group: Option<String>,
-    
+
     #[arg(long = "rootfs-target", value_name = "TARGET")]
     rootfs_target: Option<PathBuf>,
-    
+
     #[arg(long = "rootfs-arch", default_value = "native")]
     rootfs_arch: String,
 }
@@ -100,7 +101,6 @@ fn main() {
     }
 
     let cfg = Arc::new(config::Config::load());
-    
 
     if let Some(pkg) = args.info {
         info::print_package_info(&pkg);
@@ -134,8 +134,8 @@ fn main() {
         return;
     }
     if let Some(query) = args.search {
-       search::search_packages(&query);
-       return;
+        search::search_packages(&query);
+        return;
     }
     if !args.install.is_empty() {
         if args.install[0].starts_with('@') {
@@ -155,7 +155,6 @@ fn main() {
         }
         return;
     }
-
     if args.upgrade {
         if args.dry_run {
             let upgradable = update::list_upgradable();
@@ -173,43 +172,27 @@ fn main() {
         return;
     }
     if args.repo_list {
-       repo::list_repositories();
-       return;
+        repo::list_repositories();
+        return;
     }
-    if args.build_rootfs {
-    let arch = if args.rootfs_arch == "native" {
-        "native"
-    } else {
-        &args.rootfs_arch
-    };
-    if let (Some(group), Some(target)) = (args.rootfs_group, args.rootfs_target) {
-        if let Err(e) = rootfs::build_rootfs(&group, &target, &cfg, arch, true) {
+    if let Some(repo_args) = args.repo_remove {
+        if let Err(e) = repo::remove_repository(&repo_args) {
             eprintln!("{} {}", "[ror]".red().bold(), e);
-           }
-        } else {
-           eprintln!("{} --build-rootfs requires --rootfs-group and --rootfs-target", "[ror]".red().bold());
         }
         return;
     }
-    if let Some(args) = args.repo_remove {
-        if let Err(e) = repo::remove_repository(&args) {
-        eprintln!("{} {}", "[ror]".red().bold(), e);
-    }
+    if let Some(repo_args) = args.repo_add {
+        if repo_args.len() < 2 {
+            eprintln!("{} Usage: --repo-add <name> <url> [mirror]", "[ror]".red().bold());
+            return;
+        }
+        let name = &repo_args[0];
+        let url = &repo_args[1];
+        let mirror = if repo_args.len() > 2 { Some(repo_args[2].as_str()) } else { None };
+        if let Err(e) = repo::add_repository(name, url, mirror) {
+            eprintln!("{} {}", "[ror]".red().bold(), e);
+        }
         return;
-    }
-
-    if let Some(args) = args.repo_add {
-    if args.len() < 2 {
-        eprintln!("{} Usage: --repo-add <name> <url> [mirror]", "[ror]".red().bold());
-        return;
-    }
-    let name = &args[0];
-    let url = &args[1];
-    let mirror = if args.len() > 2 { Some(args[2].as_str()) } else { None };
-    if let Err(e) = repo::add_repository(name, url, mirror) {
-        eprintln!("{} {}", "[ror]".red().bold(), e);
-    }
-       return;
     }
     if let Some(pkg) = args.update {
         update::update_package(&pkg, &cfg, args.dry_run);

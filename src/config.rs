@@ -34,7 +34,7 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Self {
-        let path = Path::new("/var/ror/ror.conf");
+        let path = Path::new("/etc/ror/ror.conf");
         if path.exists() {
             let content = fs::read_to_string(path).unwrap_or_default();
             Self::from_ini(&content).unwrap_or_else(|e| {
@@ -49,18 +49,19 @@ impl Config {
             Config::default()
         }
     }
+
     pub fn to_ini(&self) -> Result<String, config::ConfigError> {
         let mut lines = vec!["[global]".to_string()];
         lines.push(format!("ignore_speed = {}", self.global.ignore_speed));
         lines.push(format!("strict_gpg = {}", self.global.strict_gpg));
-        lines.push("".to_string());
+        lines.push(String::new());
         for (name, repo) in &self.repositories {
             lines.push(format!("[repositories.{}]", name));
             lines.push(format!("url = \"{}\"", repo.url));
             if let Some(m) = &repo.mirror {
                 lines.push(format!("mirror = \"{}\"", m));
             }
-            lines.push("".to_string());
+            lines.push(String::new());
         }
         Ok(lines.join("\n"))
     }
@@ -73,16 +74,16 @@ impl Config {
     }
 
     pub fn create_default_config(path: &Path) -> std::io::Result<()> {
-        let ini = r#"[global]
-ignore_speed = false
-strict_gpg = false
-
-[repositories.rorkos]
-url = "https:
-mirror = "https:
-"#;
+        let ini = concat!(
+            "[global]\n",
+            "ignore_speed = false\n",
+            "strict_gpg = false\n",
+            "\n",
+            "[repositories.rorkos]\n",
+            "url = \"https://github.com/RorkOS/RorkOS_package\"\n",
+            "mirror = \"https://github.com/rork-os/RorkOS_package\"\n",
+        );
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(path, ini)
     }
 }
-

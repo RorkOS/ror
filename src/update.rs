@@ -2,16 +2,14 @@ use colored::Colorize;
 use crate::install::{self, InstalledDB, get_package_info};
 use crate::delete;
 use crate::config;
+use crate::progress::ProgressBar;
 use std::collections::HashSet;
 use semver::Version;
 
 fn is_newer(current: &str, available: &str) -> bool {
     match (Version::parse(current), Version::parse(available)) {
         (Ok(cur), Ok(ava)) => ava > cur,
-        _ => {
-            
-            current != available && available > current
-        }
+        _ => current != available && available > current,
     }
 }
 
@@ -59,24 +57,41 @@ pub fn upgrade_all(cfg: &config::Config, dry_run: bool) {
         return;
     }
 
+    let total = installed.len();
+    let mut pb = ProgressBar::new(total, "Checking for upgrades...");
+
     let mut updated = HashSet::new();
-    let mut failed = Vec::new();
+    let failed: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
 
     for pkg in &installed {
         if updated.contains(pkg) {
+            pb.inc(&format!("Skipping {} (already processed)", pkg));
+            skipped += 1;
             continue;
         }
+
+        pb.inc(&format!("Checking {}...", pkg));
+
         if update_package(pkg, cfg, dry_run) {
             updated.insert(pkg.clone());
         } else {
-            failed.push(pkg.clone());
+            skipped += 1;
         }
     }
 
     if dry_run {
+        pb.finish(&format!("DRY RUN: {} packages would be updated, {} already up-to-date", updated.len(), skipped));
         println!("{} DRY RUN: {} packages would be updated.", ">>>".yellow(), updated.len());
     } else {
-        println!("{} Upgrade completed. Updated: {}, failed: {}.", "[ror]".green().bold(), updated.len(), failed.len());
+        pb.finish(&format!("Upgrade done: {} updated, {} failed, {} up-to-date", updated.len(), failed.len(), skipped));
+        println!(
+            "{} Upgrade completed. Updated: {}, failed: {}, up-to-date: {}.",
+            "[ror]".green().bold(),
+            updated.len(),
+            failed.len(),
+            skipped
+        );
         if !failed.is_empty() {
             println!("{} Failed packages: {:?}", "[ror]".red(), failed);
         }

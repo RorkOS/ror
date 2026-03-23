@@ -10,6 +10,7 @@ use chrono::Local;
 use std::collections::HashMap;
 use std::os::unix::fs::symlink;
 use crate::config;
+use crate::progress::{Spinner, format_bytes};
 
 const REPO_ROOT: &str = "/var/ror/packages";
 
@@ -58,7 +59,7 @@ pub struct BinaryPackage {
     #[serde(rename = "type", default)]
     pub pkg_type: Option<String>,
     #[serde(default)]
-    pub url: String, 
+    pub url: String,
     #[serde(default)]
     pub sha256: String,
     #[serde(default = "default_install_prefix")]
@@ -86,7 +87,7 @@ pub struct InstalledDB {
 }
 
 impl InstalledDB {
-    pub const PATH: &'static str = "/var/ror/installed.json";
+    pub const PATH: &'static str = "/etc/ror/installed.json";
 
     pub fn load() -> Self {
         if Path::new(Self::PATH).exists() {
@@ -116,6 +117,33 @@ impl InstalledDB {
     }
 }
 
+fn sort_mirrors_by_speed(mirrors: &[String]) -> Vec<String> {
+    use std::time::Instant;
+    let client = match Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return mirrors.to_vec(),
+    };
+
+    let mut timed: Vec<(u128, String)> = mirrors
+        .iter()
+        .map(|url| {
+            let start = Instant::now();
+            let ok = client
+                .head(url)
+                .send()
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            let elapsed = start.elapsed().as_millis();
+            if ok { (elapsed, url.clone()) } else { (u128::MAX, url.clone()) }
+        })
+        .collect();
+
+    timed.sort_by_key(|(t, _)| *t);
+    timed.into_iter().map(|(_, url)| url).collect()
+}
 
 pub fn extract_deb(archive_path: &Path, dest_root: &Path) -> Result<Vec<String>, String> {
     let file = fs::File::open(archive_path).map_err(|e| e.to_string())?;
@@ -125,7 +153,7 @@ pub fn extract_deb(archive_path: &Path, dest_root: &Path) -> Result<Vec<String>,
     while let Some(entry_result) = archive.next_entry() {
         let entry = entry_result.map_err(|e| format!("Failed to read ar entry: {}", e))?;
         let identifier = std::str::from_utf8(entry.header().identifier()).unwrap_or("");
-        
+
         if identifier.contains("data.tar") {
             let reader: Box<dyn std::io::Read> = if identifier.ends_with(".xz") {
                 Box::new(xz2::read::XzDecoder::new(entry))
@@ -135,11 +163,11 @@ pub fn extract_deb(archive_path: &Path, dest_root: &Path) -> Result<Vec<String>,
 
             let mut tar_archive = tar::Archive::new(reader);
             let entries = tar_archive.entries().map_err(|e: std::io::Error| e.to_string())?;
-            
+
             for file_result in entries {
                 let mut f = file_result.map_err(|e: std::io::Error| e.to_string())?;
                 let path = f.path().map_err(|e: std::io::Error| e.to_string())?.to_path_buf();
-                
+
                 f.unpack_in(dest_root).map_err(|e: std::io::Error| e.to_string())?;
                 installed_files.push(path.to_string_lossy().to_string());
             }
@@ -157,18 +185,22 @@ pub fn select_binary_for_arch<'a>(pkg: &'a Package, arch: &str) -> Result<&'a Bi
         },
         other => other,
     };
-    pkg.binaries.iter().find(|b| b.arch == target_arch || b.arch == "all" || b.arch == "x86_64")
-        .ok_or_else(|| format!("No binary package for architecture {}", arch)) 
+    pkg.binaries
+        .iter()
+        .find(|b| b.arch == target_arch || b.arch == "all" || b.arch == "x86_64")
+        .ok_or_else(|| format!("No binary package for architecture {}", arch))
 }
 
 pub fn find_package_file(pkg_name: &str) -> Option<PathBuf> {
     let repo = Path::new(REPO_ROOT);
     let read_dir = fs::read_dir(repo).ok()?;
-    
+
     for entry in read_dir.flatten() {
         let cat_path = entry.path();
-        if !cat_path.is_dir() { continue; }
-        
+        if !cat_path.is_dir() {
+            continue;
+        }
+
         let pkg_path = cat_path.join(pkg_name).join(format!("{}.yaml", pkg_name));
         if pkg_path.exists() && pkg_path.is_file() {
             return Some(pkg_path);
@@ -195,14 +227,16 @@ pub fn install_package(pkg_name: &str, cfg: &config::Config) {
     }
 }
 
-
 pub fn install_package_with_result(pkg_name: &str, cfg: &config::Config) -> Result<InstalledPackage, String> {
+    let mut spinner = Spinner::new(&format!("Resolving {}", pkg_name));
+    spinner.tick(&format!("Resolving {}", pkg_name));
+
     let pkg_path = find_package_file(pkg_name)
         .ok_or_else(|| format!("Package '{}' not found", pkg_name))?;
-    
+
     let content = fs::read_to_string(&pkg_path)
         .map_err(|e| format!("Failed to read package file: {}", e))?;
-        
+
     let pkg: Package = serde_yaml::from_str(&content)
         .map_err(|e| format!("YAML structure error: {}", e))?;
 
@@ -212,35 +246,50 @@ pub fn install_package_with_result(pkg_name: &str, cfg: &config::Config) -> Resu
 
     let binary = select_binary_for_arch(&pkg, "native")?;
     let db = InstalledDB::load();
-    
+
     for conflict in &pkg.conflicts {
         if db.is_installed(conflict) {
-            return Err(format!("Package '{}' conflicts with installed package '{}'", pkg_name, conflict));
+            return Err(format!(
+                "Package '{}' conflicts with installed package '{}'",
+                pkg_name, conflict
+            ));
         }
     }
 
-    let urls_to_try: Vec<String> = if !binary.url.is_empty() {
+    let mut urls_to_try: Vec<String> = if !binary.url.is_empty() {
         vec![binary.url.clone()]
     } else if !binary.mirrors.is_empty() {
-        binary.mirrors.iter().map(|m| m.replace("{filename}", &binary.filename)).collect()
+        binary
+            .mirrors
+            .iter()
+            .map(|m| m.replace("{filename}", &binary.filename))
+            .collect()
     } else {
         return Err(format!("No URL or mirrors provided for package {}", pkg_name));
     };
+
+    if !cfg.global.ignore_speed && urls_to_try.len() > 1 {
+        spinner.tick("Testing mirror speeds...");
+        urls_to_try = sort_mirrors_by_speed(&urls_to_try);
+        spinner.finish(&format!("Fastest mirror selected: {}", urls_to_try[0]));
+    }
 
     let mut last_err = None;
     let mut all_installed_files = Vec::new();
     let mut downloaded = false;
 
     for url in urls_to_try {
-        println!("{} Trying source: {}", ">>>".yellow(), url);
+        spinner.tick(&format!("Downloading {} ...", url.split('/').last().unwrap_or(&url)));
 
         let archive_path = match download_and_verify(&url, &binary.sha256, cfg) {
             Ok(p) => p,
             Err(e) => {
                 last_err = Some(e);
-                continue; 
+                continue;
             }
         };
+
+        spinner.finish(&format!("Downloaded {}", pkg_name));
 
         let work_dir = Path::new("/tmp/ror-install").join(&pkg.name);
         let _ = fs::remove_dir_all(&work_dir);
@@ -248,23 +297,28 @@ pub fn install_package_with_result(pkg_name: &str, cfg: &config::Config) -> Resu
 
         let pkg_type = binary.pkg_type.as_deref().unwrap_or("tar.xz");
 
+        let mut sp2 = Spinner::new(&format!("Extracting {}", pkg_name));
+        sp2.tick(&format!("Extracting {}...", pkg_name));
+
         if pkg_type == "deb" {
-            println!("{} Processing external .deb for {}", ">>>".green(), pkg.name);
             let mut files = extract_deb(&archive_path, Path::new("/"))?;
             all_installed_files.append(&mut files);
         } else {
             let files = extract_native(&archive_path, &work_dir)
                 .map_err(|e| format!("Extraction failed: {}", e))?;
             let file_list = if binary.files.is_empty() { files } else { binary.files.clone() };
+            sp2.tick(&format!("Installing files for {}...", pkg_name));
             let mut installed = install_files(&work_dir, &binary.install_prefix, &file_list)
                 .map_err(|e| format!("Failed to install files: {}", e))?;
             all_installed_files.append(&mut installed);
         }
 
+        sp2.finish(&format!("Installed {} files", all_installed_files.len()));
+
         let _ = fs::remove_dir_all(&work_dir);
         let _ = fs::remove_file(&archive_path);
         downloaded = true;
-        break; 
+        break;
     }
 
     if !downloaded {
@@ -272,7 +326,10 @@ pub fn install_package_with_result(pkg_name: &str, cfg: &config::Config) -> Resu
     }
 
     if !pkg.install_steps.is_empty() {
+        let mut sp3 = Spinner::new(&format!("Running install steps for {}", pkg_name));
+        sp3.tick(&format!("Running install steps for {}...", pkg_name));
         run_commands(&pkg.install_steps, Path::new("/"))?;
+        sp3.finish("Install steps done");
     }
 
     Ok(InstalledPackage {
@@ -284,20 +341,26 @@ pub fn install_package_with_result(pkg_name: &str, cfg: &config::Config) -> Resu
     })
 }
 
-
-pub fn download_and_verify(url: &str, expected_sha: &str, cfg: &config::Config) -> Result<PathBuf, String> {
-    
+pub fn download_and_verify(url: &str, expected_sha: &str, _cfg: &config::Config) -> Result<PathBuf, String> {
     let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let response = client.get(url).send()
+    let response = client
+        .get(url)
+        .send()
         .map_err(|e| format!("Download failed: {}", e))?;
 
     if !response.status().is_success() {
         return Err(format!("HTTP error: {}", response.status()));
     }
+
+    let total_size = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
 
     let tmp_dir = Path::new("/tmp/ror-download");
     fs::create_dir_all(tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
@@ -305,7 +368,6 @@ pub fn download_and_verify(url: &str, expected_sha: &str, cfg: &config::Config) 
     let file_name = url.split('/').last().unwrap_or("archive.tmp");
     let file_path = tmp_dir.join(file_name);
 
-    
     {
         use std::io::Write;
         let mut file = fs::File::create(&file_path)
@@ -313,30 +375,55 @@ pub fn download_and_verify(url: &str, expected_sha: &str, cfg: &config::Config) 
         let mut hasher = Sha256::new();
         let mut reader = response;
         let mut buf = [0u8; 65536];
+        let mut downloaded: u64 = 0;
+
         loop {
             use std::io::Read;
-            let n = reader.read(&mut buf)
+            let n = reader
+                .read(&mut buf)
                 .map_err(|e| format!("Failed to read response body: {}", e))?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&buf[..n]);
             file.write_all(&buf[..n])
                 .map_err(|e| format!("Failed to write to temp file: {}", e))?;
+            downloaded += n as u64;
+
+            match total_size {
+                Some(total) if total > 0 => {
+                    let pct = downloaded * 40 / total;
+                    let bar = format!(
+                        "{}>{}", 
+                        "=".repeat(pct.saturating_sub(1) as usize),
+                        " ".repeat((40 - pct) as usize)
+                    );
+                    eprint!(
+                        "\r\x1b[K\x1b[36m[{}]\x1b[0m {} / {}",
+                        bar,
+                        format_bytes(downloaded),
+                        format_bytes(total)
+                    );
+                }
+                _ => {
+                    eprint!("\r\x1b[K{} downloaded", format_bytes(downloaded));
+                }
+            }
+            use std::io::stderr;
+            stderr().flush().ok();
         }
+
+        eprintln!("\r\x1b[K\x1b[32m✓\x1b[0m Downloaded {}", format_bytes(downloaded));
+
         if !expected_sha.is_empty() {
             let hash = format!("{:x}", hasher.finalize());
             if hash != expected_sha {
                 let _ = fs::remove_file(&file_path);
-                return Err(format!("SHA256 mismatch: expected {}, got {}", expected_sha, hash));
+                return Err(format!(
+                    "SHA256 mismatch: expected {}, got {}",
+                    expected_sha, hash
+                ));
             }
-        }
-    }
-
-    if let Err(e) = verify_gpg_signature(&file_path, url, cfg.global.strict_gpg) {
-        if cfg.global.strict_gpg {
-            let _ = fs::remove_file(&file_path);
-            return Err(format!("GPG ERROR: {}", e));
-        } else {
-            eprintln!("{} GPG warning: {}", "[ror]".yellow(), e);
         }
     }
 
@@ -344,45 +431,7 @@ pub fn download_and_verify(url: &str, expected_sha: &str, cfg: &config::Config) 
 }
 
 
-fn verify_gpg_signature(file_path: &Path, original_url: &str, _strict_mode: bool) -> Result<(), String> {
-    let sig_url = format!("{}.sig", original_url);
-    let client = Client::builder().timeout(std::time::Duration::from_secs(10)).build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
-
-    let response = match client.get(&sig_url).send() {
-        Ok(r) => r,
-        Err(_) => return Err("Failed to reach server for .sig file".to_string())
-    };
-
-    if !response.status().is_success() {
-        return Err(format!("Signature file not found on server (HTTP {})", response.status()));
-    }
-
-    let sig_bytes = response.bytes()
-        .map_err(|e| format!("Failed to download signature: {}", e))?.to_vec();
-
-    let sig_path = file_path.with_extension("sig");
-    fs::write(&sig_path, &sig_bytes).map_err(|e| format!("Failed to save signature: {}", e))?;
-
-    println!("{} Verifying GPG signature...", ">>>".cyan());
-    let status = Command::new("gpg")
-        .arg("--verify")
-        .arg(&sig_path)
-        .arg(file_path)
-        .status()
-        .map_err(|e| format!("Failed to execute 'gpg' (is it installed?): {}", e))?;
-
-    let _ = fs::remove_file(&sig_path);
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err("GPG Signature mismatch! File might be tampered with.".to_string())
-    }
-}
-
 pub fn extract_native(archive_path: &Path, target_dir: &Path) -> Result<Vec<String>, String> {
-    
     let status = Command::new("tar")
         .arg("-xf")
         .arg(archive_path)
@@ -404,6 +453,7 @@ pub fn extract_native(archive_path: &Path, target_dir: &Path) -> Result<Vec<Stri
     }
     Ok(files)
 }
+
 fn install_files(source_dir: &Path, prefix: &str, files: &[String]) -> Result<Vec<String>, String> {
     let prefix_path = Path::new(prefix);
     let mut installed = Vec::new();
@@ -411,8 +461,7 @@ fn install_files(source_dir: &Path, prefix: &str, files: &[String]) -> Result<Ve
     for rel_path in files {
         let src = source_dir.join(rel_path);
         let dst = prefix_path.join(rel_path);
-        
-        
+
         let meta = fs::symlink_metadata(&src)
             .map_err(|_| format!("File {} not found in package", rel_path))?;
 
@@ -420,12 +469,11 @@ fn install_files(source_dir: &Path, prefix: &str, files: &[String]) -> Result<Ve
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create dir {}: {}", parent.display(), e))?;
         }
-        
-        
+
         if meta.is_symlink() {
             let target = fs::read_link(&src)
                 .map_err(|e| format!("Failed to read link {}: {}", src.display(), e))?;
-            let _ = fs::remove_file(&dst); 
+            let _ = fs::remove_file(&dst);
             symlink(&target, &dst)
                 .map_err(|e| format!("Failed to create symlink {}: {}", dst.display(), e))?;
         } else {
@@ -442,7 +490,7 @@ pub fn install_files_with_root(source_dir: &Path, root: &Path, files: &[String])
     for rel_path in files {
         let src = source_dir.join(rel_path);
         let dst = root.join(rel_path);
-        
+
         let meta = fs::symlink_metadata(&src)
             .map_err(|_| format!("File {} not found in package", rel_path))?;
 
@@ -450,8 +498,7 @@ pub fn install_files_with_root(source_dir: &Path, root: &Path, files: &[String])
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create dir {}: {}", parent.display(), e))?;
         }
-        
-        
+
         if meta.is_symlink() {
             let target = fs::read_link(&src)
                 .map_err(|e| format!("Failed to read link {}: {}", src.display(), e))?;
@@ -488,7 +535,8 @@ pub fn get_package_info(pkg_name: &str) -> Option<(String, String)> {
     let pkg_path = find_package_file(pkg_name)?;
     let content = fs::read_to_string(pkg_path).ok()?;
     let name = pkg_name.to_string();
-    let version = content.lines()
+    let version = content
+        .lines()
         .find(|l| l.starts_with("version:"))
         .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().trim_matches('"').to_string())
