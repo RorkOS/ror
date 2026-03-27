@@ -21,6 +21,8 @@ The package manager for RorkOS. Installs, removes, and updates binary packages f
       --rootfs-group <GROUP> #creates rootfs with group          
       --rootfs-target <TARGET>#installs root force in a separate folder         
       --rootfs-arch <ROOTFS_ARCH>      [default: native] #installs rootfs for a specific architecture
+      --di <DELETE> <INSTALL> #will remove and install the package         
+      --lg     #displays a list of all groups
   -h, --help                           Print help
 ```
 
