@@ -64,3 +64,22 @@ pub fn load_group(group_name: &str) -> Result<Group, String> {
         .map_err(|e| format!("Group YAML error: {}", e))?;
     Ok(group)
 }
+pub fn list_groups() {
+    let groups_dir = "/var/ror/packages/groups";
+    if !Path::new(groups_dir).exists() {
+        println!("{} Groups directory not found.", "[ror]".yellow());
+        return;
+    }
+
+    println!("{} Available package groups:", "[ror]".blue().bold());
+    if let Ok(entries) = std::fs::read_dir(groups_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".yaml") {
+                    let group_name = name.trim_end_matches(".yaml");
+                    println!("  {}", group_name.green());
+                }
+            }
+        }
+    }
+}

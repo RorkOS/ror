@@ -11,7 +11,7 @@ pub struct RepositoryConfig {
     pub mirror: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GlobalConfig {
     #[serde(default = "default_ignore_speed")]
     pub ignore_speed: bool,
@@ -19,12 +19,26 @@ pub struct GlobalConfig {
     pub strict_gpg: bool,
     #[serde(default)]
     pub allow_external_binaries: bool,
+    #[serde(default = "default_parallel_downloads")]
+    pub parallel_downloads: usize,
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            ignore_speed: false,
+            strict_gpg: false,
+            allow_external_binaries: false,
+            parallel_downloads: default_parallel_downloads(),
+        }
+    }
 }
 
 fn default_ignore_speed() -> bool { false }
 fn default_strict_gpg() -> bool { false }
+fn default_parallel_downloads() -> usize { 4 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Config {
     #[serde(default)]
     pub global: GlobalConfig,
@@ -54,6 +68,7 @@ impl Config {
         let mut lines = vec!["[global]".to_string()];
         lines.push(format!("ignore_speed = {}", self.global.ignore_speed));
         lines.push(format!("strict_gpg = {}", self.global.strict_gpg));
+        lines.push(format!("parallel_downloads = {}", self.global.parallel_downloads));
         lines.push(String::new());
         for (name, repo) in &self.repositories {
             lines.push(format!("[repositories.{}]", name));
@@ -78,6 +93,7 @@ impl Config {
             "[global]\n",
             "ignore_speed = false\n",
             "strict_gpg = false\n",
+            "parallel_downloads = 4\n",
             "\n",
             "[repositories.rorkos]\n",
             "url = \"https://github.com/RorkOS/RorkOS_package\"\n",

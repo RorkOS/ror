@@ -506,6 +506,8 @@ pub fn install_files_with_root(source_dir: &Path, root: &Path, files: &[String])
             symlink(&target, &dst)
                 .map_err(|e| format!("Failed to create symlink {}: {}", dst.display(), e))?;
         } else {
+            let _ = fs::remove_file(&dst);
+
             fs::copy(&src, &dst)
                 .map_err(|e| format!("Failed to copy {}: {}", src.display(), e))?;
         }

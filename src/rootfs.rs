@@ -1,16 +1,254 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::collections::HashSet;
 use std::process::Command;
 use std::os::unix::fs::symlink;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use colored::Colorize;
+use serde::Serialize;
 use crate::config;
 use crate::group::Group;
 use crate::progress::ProgressBar;
 use crate::install::{
-    Dependency, Package, load_package, download_and_verify,
+    Dependency, load_package, download_and_verify,
     extract_native, install_files_with_root, select_binary_for_arch,
 };
+
+struct DownloadTask {
+    pkg_name: String,
+    urls: Vec<String>,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct InstalledEntry {
+    name: String,
+    version: String,
+}
+
+#[derive(Serialize)]
+struct ListInstalled {
+    packages: Vec<InstalledEntry>,
+}
+
+fn collect_install_order(start_pkgs: &[String]) -> Result<Vec<String>, String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    fn visit(
+        name: &str,
+        visited: &mut HashSet<String>,
+        order: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        visited.insert(name.to_string());
+
+        let pkg = load_package(name)
+            .ok_or_else(|| format!("Package '{}' not found in repository", name))?;
+
+        for dep in &pkg.depends {
+            match dep {
+                Dependency::Single(d) => visit(d, visited, order)?,
+                Dependency::Any(alts) => {
+                    if let Some(first) = alts.first() {
+                        visit(first, visited, order)?;
+                    }
+                }
+            }
+        }
+
+        order.push(name.to_string());
+        Ok(())
+    }
+
+    for pkg in start_pkgs {
+        visit(pkg, &mut visited, &mut order)?;
+    }
+
+    Ok(order)
+}
+
+fn build_download_tasks(packages: &[String], target_arch: &str) -> Result<Vec<DownloadTask>, String> {
+    let mut tasks = Vec::new();
+    for pkg_name in packages {
+        let pkg = load_package(pkg_name)
+            .ok_or_else(|| format!("Package '{}' not found", pkg_name))?;
+
+        let binary = select_binary_for_arch(&pkg, target_arch)
+            .map_err(|e| format!("No binary for '{}': {}", pkg_name, e))?;
+
+        let urls: Vec<String> = if !binary.url.is_empty() {
+            vec![binary.url.clone()]
+        } else {
+            binary.mirrors.iter()
+                .map(|m| m.replace("{filename}", &binary.filename))
+                .collect()
+        };
+
+        if urls.is_empty() {
+            return Err(format!("No download URLs for package '{}'", pkg_name));
+        }
+
+        tasks.push(DownloadTask {
+            pkg_name: pkg_name.clone(),
+            urls,
+            sha256: binary.sha256.clone(),
+        });
+    }
+
+    Ok(tasks)
+}
+
+fn download_parallel(
+    tasks: Vec<DownloadTask>,
+    cfg: Arc<config::Config>,
+    n_parallel: usize,
+) -> Result<HashMap<String, std::path::PathBuf>, String> {
+    let n = n_parallel.max(1).min(tasks.len().max(1));
+    let total = tasks.len();
+    println!(
+        "{} Downloading {} packages ({} in parallel)...",
+        ">>>".cyan().bold(),
+        total,
+        n
+    );
+
+    let queue: Arc<Mutex<VecDeque<DownloadTask>>> =
+        Arc::new(Mutex::new(tasks.into_iter().collect()));
+
+    let results: Arc<Mutex<HashMap<String, std::path::PathBuf>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let done_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+
+    let mut handles = vec![];
+
+    for _ in 0..n {
+        let queue = Arc::clone(&queue);
+        let results = Arc::clone(&results);
+        let first_error = Arc::clone(&first_error);
+        let done_count = Arc::clone(&done_count);
+        let cfg = Arc::clone(&cfg);
+
+        handles.push(thread::spawn(move || {
+            loop {
+                if first_error.lock().unwrap().is_some() {
+                    return;
+                }
+
+                let task = queue.lock().unwrap().pop_front();
+                let task = match task {
+                    Some(t) => t,
+                    None => return,
+                };
+
+                let mut last_err = String::new();
+                let mut downloaded = false;
+
+                for url in &task.urls {
+                    match download_and_verify(url, &task.sha256, &cfg) {
+                        Ok(path) => {
+                            results.lock().unwrap().insert(task.pkg_name.clone(), path);
+                            downloaded = true;
+
+                            let mut count = done_count.lock().unwrap();
+                            *count += 1;
+                            eprint!(
+                                "\r\x1b[K{} [{}/{}] {} ",
+                                ">>>".green(),
+                                count,
+                                total,
+                                task.pkg_name
+                            );
+                            use std::io::Write;
+                            std::io::stderr().flush().ok();
+                            break;
+                        }
+                        Err(e) => last_err = e,
+                    }
+                }
+
+                if !downloaded {
+                    let mut err = first_error.lock().unwrap();
+                    if err.is_none() {
+                        *err = Some(format!(
+                            "Failed to download '{}': {}",
+                            task.pkg_name, last_err
+                        ));
+                    }
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().ok();
+    }
+    eprintln!();
+
+    if let Some(e) = first_error.lock().unwrap().take() {
+        return Err(e);
+    }
+
+    Ok(Arc::try_unwrap(results).unwrap().into_inner().unwrap())
+}
+
+fn install_from_archive(
+    pkg_name: &str,
+    archive_path: &std::path::Path,
+    root_dir: &Path,
+    binary_files: &[String],
+) -> Result<Vec<String>, String> {
+    let work_dir = std::path::Path::new("/tmp/ror-rootfs").join(pkg_name);
+    if work_dir.exists() {
+        fs::remove_dir_all(&work_dir)
+            .map_err(|e| format!("Failed to clean temp dir for '{}': {}", pkg_name, e))?;
+    }
+    fs::create_dir_all(&work_dir)
+        .map_err(|e| format!("Failed to create temp dir for '{}': {}", pkg_name, e))?;
+
+    let extracted = extract_native(archive_path, &work_dir)
+        .map_err(|e| format!("Extraction failed for '{}': {}", pkg_name, e))?;
+
+    let file_list = if binary_files.is_empty() {
+        extracted
+    } else {
+        binary_files.to_vec()
+    };
+
+    let installed = install_files_with_root(&work_dir, root_dir, &file_list)?;
+
+    let _ = fs::remove_dir_all(&work_dir);
+    let _ = fs::remove_file(archive_path);
+
+    Ok(installed)
+}
+
+fn write_listinstalled(target_dir: &Path, packages: &[String]) -> Result<(), String> {
+    let entries: Vec<InstalledEntry> = packages.iter()
+        .filter_map(|name| {
+            let pkg = load_package(name)?;
+            Some(InstalledEntry { name: pkg.name, version: pkg.version })
+        })
+        .collect();
+
+    let list = ListInstalled { packages: entries };
+    let yaml = serde_yaml::to_string(&list)
+        .map_err(|e| format!("Failed to serialize listinstalled: {}", e))?;
+
+    let out_dir = target_dir.join("var/ror");
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Failed to create var/ror: {}", e))?;
+
+    fs::write(out_dir.join("listinstalled.yaml"), yaml)
+        .map_err(|e| format!("Failed to write listinstalled.yaml: {}", e))?;
+
+    Ok(())
+}
 
 fn setup_usr_merge(target_dir: &Path) -> Result<(), String> {
     for dir in &["bin", "lib", "lib64", "sbin"] {
@@ -32,11 +270,11 @@ fn setup_usr_merge(target_dir: &Path) -> Result<(), String> {
     }
 
     for (link, target) in &[
-        ("bin",   "usr/bin"),
-        ("lib",   "usr/lib"),
+        ("bin", "usr/bin"),
+        ("lib", "usr/lib"),
         ("lib64", "usr/lib64"),
-        ("sbin",  "usr/sbin"),
-    ] {
+        ("sbin", "usr/sbin"),
+] {
         symlink(target, target_dir.join(link))
             .map_err(|e| format!("Failed to create symlink {} -> {}: {}", link, target, e))?;
     }
@@ -44,13 +282,43 @@ fn setup_usr_merge(target_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn create_fhs_skeleton(target_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dirs = &[
+        "boot", "dev", "dev/pts", "dev/shm", "etc", "etc/ror",
+        "home", "mnt", "opt", "proc", "root", "run", "srv", "sys",
+        "tmp", "usr/include", "usr/local/bin", "usr/local/lib",
+        "usr/local/share", "usr/share", "usr/share/doc",
+        "var", "var/cache", "var/empty", "var/lib", "var/lock",
+        "var/log", "var/run", "var/spool", "var/tmp",
+    ];
+
+    for dir in dirs {
+        fs::create_dir_all(target_dir.join(dir))
+            .map_err(|e| format!("Failed to create FHS dir {}: {}", dir, e))?;
+    }
+
+    for dir in &["tmp", "var/tmp"] {
+        fs::set_permissions(target_dir.join(dir), fs::Permissions::from_mode(0o1777))
+            .map_err(|e| format!("Failed to set sticky bit on {}: {}", dir, e))?;
+    }
+
+    for dir in &["root", "var/empty"] {
+        fs::set_permissions(target_dir.join(dir), fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to set permissions on {}: {}", dir, e))?;
+    }
+
+    Ok(())
+}
+
 fn mount_virtual_fs(root_dir: &Path) -> Result<(), String> {
     let mounts: &[(&str, &str, &str, bool)] = &[
-        ("/dev",     "dev",     "devtmpfs", true),
-        ("/dev/pts", "dev/pts", "devpts",   true),
-        ("/dev/shm", "dev/shm", "tmpfs",    true),
-        ("proc",     "proc",    "proc",     false),
-        ("sysfs",    "sys",     "sysfs",    false),
+        ("/dev", "dev", "devtmpfs", true),
+        ("/dev/pts", "dev/pts", "devpts", true),
+        ("/dev/shm", "dev/shm", "tmpfs", true),
+        ("proc", "proc", "proc", false),
+        ("sysfs", "sys", "sysfs", false),
     ];
 
     for (src, rel, fstype, bind) in mounts {
@@ -87,16 +355,17 @@ fn umount_virtual_fs(root_dir: &Path) {
 }
 
 const SHELL_CANDIDATES: &[(&str, Option<&str>)] = &[
-    ("/bin/sh",          None),
-    ("/usr/bin/sh",      None),
-    ("/bin/dash",        None),
-    ("/usr/bin/dash",    None),
-    ("/bin/bash",        None),
-    ("/usr/bin/bash",    None),
-    ("/bin/busybox",     Some("sh")),
+    ("/bin/sh", None),
+    ("/usr/bin/sh", None),
+    ("/bin/dash", None),
+    ("/usr/bin/dash", None),
+    ("/bin/bash", None),
+    ("/usr/bin/bash", None),
+    ("/bin/busybox", Some("sh")),
     ("/usr/bin/busybox", Some("sh")),
-    ("/bin/ash",         None),
-    ("/usr/bin/ash",     None),
+    ("/bin/toybox", Some("sh")),
+    ("/bin/ash", None),
+    ("/usr/bin/ash", None),
 ];
 
 fn find_working_shell(root_dir: &Path) -> Option<(&'static str, Option<&'static str>)> {
@@ -113,9 +382,7 @@ fn find_working_shell(root_dir: &Path) -> Option<(&'static str, Option<&'static 
         cmd.arg("-c").arg("exit 0");
 
         match cmd.output() {
-            Ok(out) if out.status.success() => {
-                return Some((shell_path, subcmd));
-            }
+            Ok(out) if out.status.success() => return Some((shell_path, subcmd)),
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 eprintln!(
@@ -162,100 +429,10 @@ fn run_install_steps_in_chroot(
         Ok(())
     } else {
         Err(format!(
-            "install_steps for \'{}\' failed with exit code {:?}",
+            "install_steps for '{}' failed with exit code {:?}",
             pkg_name, status.code()
         ))
     }
-}
-
-fn process_dependencies_chroot(
-    pkg: &Package,
-    cfg: &config::Config,
-    root_dir: &Path,
-    installing: &mut HashSet<String>,
-    target_arch: &str,
-    progress: &mut ProgressBar,
-) -> Result<(), String> {
-    for dep in &pkg.depends {
-        match dep {
-            Dependency::Single(name) => {
-                if !installing.contains(name) {
-                    install_package_in_chroot(name, cfg, root_dir, installing, target_arch, progress)?;
-                }
-            }
-            Dependency::Any(alternatives) => {
-                if alternatives.iter().any(|alt| installing.contains(alt)) {
-                    continue;
-                }
-                let chosen = alternatives.first()
-                    .ok_or_else(|| format!("Empty alternative list in package {}", pkg.name))?;
-                install_package_in_chroot(chosen, cfg, root_dir, installing, target_arch, progress)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn install_package_in_chroot(
-    pkg_name: &str,
-    cfg: &config::Config,
-    root_dir: &Path,
-    installing: &mut HashSet<String>,
-    target_arch: &str,
-    progress: &mut ProgressBar,
-) -> Result<(), String> {
-    if installing.contains(pkg_name) {
-        println!(
-            "{} {} already queued, dependencies are already installed",
-            "[ror]".green(),
-            pkg_name.green()
-        );
-        return Ok(());
-    }
-    installing.insert(pkg_name.to_string());
-
-    let pkg = load_package(pkg_name)
-        .ok_or_else(|| format!("Package '{}' not found", pkg_name))?;
-
-    process_dependencies_chroot(&pkg, cfg, root_dir, installing, target_arch, progress)?;
-
-    let binary = select_binary_for_arch(&pkg, target_arch)
-        .map_err(|e| format!("Failed to select binary for {}: {}", pkg_name, e))?;
-
-    progress.inc(&format!("Installing {}", pkg_name));
-
-    let mut last_err = None;
-    for mirror in &binary.mirrors {
-        let url = mirror.replace("{filename}", &binary.filename);
-
-        let archive_path = match download_and_verify(&url, &binary.sha256, cfg) {
-            Ok(p) => p,
-            Err(e) => { last_err = Some(e); continue; }
-        };
-
-        let work_dir = Path::new("/tmp/ror-install").join(&pkg.name);
-        if work_dir.exists() {
-            fs::remove_dir_all(&work_dir)
-                .map_err(|e| format!("Failed to clean temp dir: {}", e))?;
-        }
-        fs::create_dir_all(&work_dir)
-            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
-
-        let files = extract_native(&archive_path, &work_dir)
-            .map_err(|e| format!("Extraction failed: {}", e))?;
-
-        let file_list = if binary.files.is_empty() { files } else { binary.files.clone() };
-
-        install_files_with_root(&work_dir, root_dir, &file_list)?;
-
-        let _ = fs::remove_dir_all(&work_dir);
-        let _ = fs::remove_file(&archive_path);
-
-        println!("{} Installed {} into {}", ">>>".green(), pkg_name, root_dir.display());
-        return Ok(());
-    }
-
-    Err(last_err.unwrap_or_else(|| "All mirrors failed".into()))
 }
 
 fn run_all_install_steps(
@@ -264,7 +441,6 @@ fn run_all_install_steps(
     target_dir: &Path,
 ) -> Result<(), String> {
     let mut done: HashSet<String> = HashSet::new();
-
     let mut queue: Vec<&str> = group_order.iter().map(|s| s.as_str()).collect();
 
     let mut extras: Vec<String> = all_installed.iter()
@@ -272,7 +448,9 @@ fn run_all_install_steps(
         .cloned()
         .collect();
     extras.sort();
-    for e in &extras { queue.push(e.as_str()); }
+    for e in &extras {
+        queue.push(e.as_str());
+    }
 
     let steps_pkgs: Vec<String> = queue.iter()
         .filter(|&&pkg_name| {
@@ -282,8 +460,7 @@ fn run_all_install_steps(
         .map(|s| s.to_string())
         .collect();
 
-    let total_steps = steps_pkgs.len();
-    let mut pb = ProgressBar::new(total_steps.max(1), "Running install steps...");
+    let mut pb = ProgressBar::new(steps_pkgs.len().max(1), "Running install steps...");
 
     let (shell, subcmd) = find_working_shell(target_dir)
         .ok_or_else(|| "No working shell found in rootfs. Tried: sh, dash, bash, busybox, ash".to_string())?;
@@ -292,7 +469,9 @@ fn run_all_install_steps(
         subcmd.map(|s| format!(" {}", s)).unwrap_or_default());
 
     for pkg_name in queue {
-        if done.contains(pkg_name) || !all_installed.contains(pkg_name) { continue; }
+        if done.contains(pkg_name) || !all_installed.contains(pkg_name) {
+            continue;
+        }
         done.insert(pkg_name.to_string());
 
         if let Some(pkg) = load_package(pkg_name) {
@@ -330,37 +509,73 @@ pub fn build_rootfs(
     let group: Group = serde_yaml::from_str(&content)
         .map_err(|e| format!("Group YAML error: {}", e))?;
 
-    println!("{} Building rootfs in {} with group '{}'",
-        "[ror]".blue().bold(), target_dir.display(), group_name);
+    println!(
+        "{} Building rootfs in {} with group '{}'",
+        "[ror]".blue().bold(),
+        target_dir.display(),
+        group_name
+    );
     if let Some(desc) = &group.description {
         println!("{} {}", "Description:".yellow(), desc);
     }
 
     println!("\n{} Phase 0: UsrMerge...", ">>>".cyan().bold());
     setup_usr_merge(target_dir)?;
-    println!("{} UsrMerge done: bin/lib/lib64/sbin are now symlinks into usr/", ">>>".green());
+    println!("{} bin/lib/lib64/sbin are now symlinks into usr/", ">>>".green());
 
-    println!("\n{} Phase 1: installing files...", ">>>".cyan().bold());
+    println!("{} Creating FHS skeleton...", ">>>".cyan());
+    create_fhs_skeleton(target_dir)?;
+    println!("{} FHS skeleton created.", ">>>".green());
 
-    let estimated_total = group.packages.len() * 3;
-    let mut pb = ProgressBar::new(estimated_total.max(1), "Starting...");
+    println!("\n{} Phase 1a: Resolving packages...", ">>>".cyan().bold());
+    let all_packages = collect_install_order(&group.packages)?;
+    println!("{} {} packages to install (including dependencies)", ">>>".green(), all_packages.len());
 
+    println!("\n{} Phase 1b: Building download queue...", ">>>".cyan().bold());
+    let tasks = build_download_tasks(&all_packages, target_arch)?;
+
+    let n_parallel = cfg.global.parallel_downloads.max(1);
+    let cfg_arc = Arc::new(cfg.clone());
+    let downloaded = download_parallel(tasks, cfg_arc, n_parallel)?;
+    println!("{} All downloads complete.", ">>>".green().bold());
+
+    println!("\n{} Phase 1c: Installing files...", ">>>".cyan().bold());
     let mut installing: HashSet<String> = HashSet::new();
-    for pkg in &group.packages {
-        install_package_in_chroot(pkg, cfg, target_dir, &mut installing, target_arch, &mut pb)?;
+    let mut pb = ProgressBar::new(all_packages.len().max(1), "Installing...");
+
+    for pkg_name in &all_packages {
+        let pkg = load_package(pkg_name)
+            .ok_or_else(|| format!("Package '{}' not found", pkg_name))?;
+
+        let binary = select_binary_for_arch(&pkg, target_arch)
+            .map_err(|e| format!("Arch selection failed for '{}': {}", pkg_name, e))?;
+
+        let archive_path = downloaded.get(pkg_name)
+            .ok_or_else(|| format!("Archive for '{}' was not downloaded", pkg_name))?;
+
+        pb.inc(&format!("Installing {}", pkg_name));
+        install_from_archive(pkg_name, archive_path, target_dir, &binary.files)?;
+        installing.insert(pkg_name.clone());
     }
-    pb.finish(&format!("Phase 1 complete: {} packages installed", installing.len()));
-    println!("{} Phase 1 complete: {} packages.", ">>>".green(), installing.len());
+    pb.finish(&format!("{} packages installed", installing.len()));
+
+    println!("\n{} Writing listinstalled.yaml...", ">>>".cyan());
+    write_listinstalled(target_dir, &all_packages)?;
+    println!("{} listinstalled.yaml written to var/ror/", ">>>".green());
 
     if run_ldconfig {
         println!("{} Running ldconfig...", ">>>".cyan());
+        let ld_conf = target_dir.join("etc/ld.so.conf");
+        if !ld_conf.exists() {
+            let _ = fs::write(&ld_conf, "/usr/lib\n/usr/lib64\n");
+        }
         match Command::new("ldconfig").arg("-r").arg(target_dir).status() {
             Ok(s) if s.success() => println!("{} ldconfig done.", ">>>".green()),
             _ => eprintln!("{} ldconfig failed (non-fatal)", "[ror]".yellow()),
         }
     }
 
-    println!("\n{} Phase 2: running install_steps in chroot...", ">>>".cyan().bold());
+    println!("\n{} Phase 2: Running install_steps in chroot...", ">>>".cyan().bold());
     println!("{} Mounting /dev /proc /sys...", ">>>".cyan());
     mount_virtual_fs(target_dir)?;
 
@@ -371,7 +586,10 @@ pub fn build_rootfs(
 
     result?;
 
-    println!("\n{} Rootfs created successfully at {}",
-        "[ror]".green().bold(), target_dir.display());
+    println!(
+        "\n{} Rootfs built successfully at {} ",
+        "[ror]".green().bold(),
+        target_dir.display()
+    );
     Ok(())
 }

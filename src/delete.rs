@@ -4,37 +4,128 @@ use colored::Colorize;
 use std::process::Command;
 use crate::install::{load_package, InstalledDB, Package, find_package_file};
 
+const CRITICAL_ROLES: &[&str] = &["init-system", "sh"];
+
 fn has_role(pkg_name: &str, role: &str) -> bool {
-    if let Some(pkg) = load_package(pkg_name) {
-        return pkg.provides.contains(&role.to_string());
-    }
-    false
+    load_package(pkg_name)
+        .map(|p| p.provides.contains(&role.to_string()))
+        .unwrap_or(false)
 }
 
 pub fn check_critical_removal(pkg_name: &str, db: &InstalledDB) -> Result<(), String> {
     let pkg = load_package(pkg_name).ok_or("Package info not found in repository")?;
 
-    if pkg.provides.contains(&"init-system".to_string()) {
-        let other_inits_count = db.packages.values()
-            .filter(|p| p.name != pkg_name && has_role(&p.name, "init-system"))
+    for &role in CRITICAL_ROLES {
+        if !pkg.provides.contains(&role.to_string()) {
+            continue;
+        }
+        let others = db.packages.values()
+            .filter(|p| p.name != pkg_name && has_role(&p.name, role))
             .count();
-
-        if other_inits_count == 0 {
+        if others == 0 {
             return Err(format!(
-                "{} CRITICAL ERROR: '{}' is your last init-system! Removing it will break RorkOS. Install an alternative first.",
+                "{} CRITICAL: '{}' is your only provider of '{}'. Install an alternative first, or use --di to replace atomically.",
                 "[ror]".red().bold(),
+                pkg_name,
+                role
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn check_critical_removal_with_replacement(pkg_name: &str, replacement: &str, db: &InstalledDB) -> Result<(), String> {
+    let pkg = load_package(pkg_name).ok_or("Package info not found in repository")?;
+    let replacement_pkg = load_package(replacement).ok_or("Replacement package not found in repository")?;
+
+    for &role in CRITICAL_ROLES {
+        if !pkg.provides.contains(&role.to_string()) {
+            continue;
+        }
+        let replacement_covers = replacement_pkg.provides.contains(&role.to_string());
+        let other_installed = db.packages.values()
+            .filter(|p| p.name != pkg_name && has_role(&p.name, role))
+            .count();
+        if !replacement_covers && other_installed == 0 {
+            return Err(format!(
+                "{} CRITICAL: removing '{}' would leave the system without a '{}' provider, and '{}' does not provide it.",
+                "[ror]".red().bold(),
+                pkg_name,
+                role,
+                replacement
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn check_critical_install(pkg_name: &str, db: &InstalledDB) -> Result<(), String> {
+    let pkg = load_package(pkg_name).ok_or("Package info not found in repository")?;
+
+    for &role in CRITICAL_ROLES {
+        if !pkg.provides.contains(&role.to_string()) {
+            continue;
+        }
+        if let Some(existing) = db.packages.values().find(|p| has_role(&p.name, role)) {
+            return Err(format!(
+                "{} CRITICAL: '{}' provides '{}', but '{}' already provides it. Use --di {} {} to replace it atomically.",
+                "[ror]".red().bold(),
+                pkg_name,
+                role,
+                existing.name,
+                existing.name,
                 pkg_name
             ));
         }
     }
+
     Ok(())
+}
+
+pub fn remove_package_files_only(pkg_name: &str, files: &[String]) -> bool {
+    let mut failed = false;
+
+    for rel_path in files {
+        let full_path = Path::new("/").join(rel_path);
+        if full_path.exists() {
+            if let Err(e) = fs::remove_file(&full_path) {
+                eprintln!("{} Failed to remove {}: {}", "[ror]".red().bold(), full_path.display(), e);
+                failed = true;
+            } else {
+                println!("{} Removed {}", ">>>".green(), full_path.display());
+            }
+        }
+    }
+
+    if let Some(pkg_path) = find_package_file(pkg_name) {
+        if let Ok(content) = fs::read_to_string(pkg_path) {
+            if let Ok(pkg) = serde_yaml::from_str::<Package>(&content) {
+                if !pkg.delete_steps.trim().is_empty() {
+                    println!("{} Running delete steps for '{}'...", ">>>".yellow(), pkg_name);
+                    let status = Command::new("sh")
+                        .arg("-c")
+                        .arg(&pkg.delete_steps)
+                        .status()
+                        .expect("Failed to execute delete steps");
+                    if !status.success() {
+                        eprintln!("{} Delete steps for '{}' failed", "[ror]".red().bold(), pkg_name);
+                        failed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    !failed
 }
 
 pub fn remove_package(pkg_name: &str) {
     let mut db = InstalledDB::load();
 
-    let record = match db.packages.get(pkg_name) {
-        Some(r) => r,
+    let files: Vec<String> = match db.packages.get(pkg_name) {
+        Some(r) => r.files.iter().cloned().collect(),
         None => {
             eprintln!("{} Package '{}' is not installed.", "[ror]".red().bold(), pkg_name);
             return;
@@ -48,54 +139,17 @@ pub fn remove_package(pkg_name: &str) {
 
     println!("{} Removing package '{}'...", "[ror]".blue().bold(), pkg_name);
 
-    let mut failed = false;
+    let success = remove_package_files_only(pkg_name, &files);
 
-    for rel_path in &record.files {
-        let full_path = Path::new("/").join(rel_path);
-        if full_path.exists() {
-            if let Err(e) = fs::remove_file(&full_path) {
-                eprintln!("{} Failed to remove {}: {}", "[ror]".red().bold(), full_path.display(), e);
-                failed = true;
-            } else {
-                println!("{} Removed {}", ">>>".green(), full_path.display());
-            }
-        } else {
-            println!("{} File {} already missing", ">>>".yellow(), full_path.display());
-        }
-    }
-
-    if let Some(pkg_path) = find_package_file(pkg_name) {
-        if let Ok(content) = fs::read_to_string(pkg_path) {
-            if let Ok(pkg) = serde_yaml::from_str::<Package>(&content) {
-                if !pkg.delete_steps.trim().is_empty() {
-                    println!("{} Running delete steps...", ">>>".yellow());
-                    let status = Command::new("sh")
-                        .arg("-c")
-                        .arg(&pkg.delete_steps)
-                        .status()
-                        .expect("Failed to execute delete steps");
-                    if !status.success() {
-                        eprintln!("{} Delete steps failed with exit code {:?}", "[ror]".red().bold(), status.code());
-                        failed = true;
-                    } else {
-                        println!("{} Delete steps completed", ">>>".green());
-                    }
-                }
-            }
-        }
-    } else {
-        println!("{} Package recipe not found, skipping delete steps", ">>>".yellow());
-    }
     db.packages.remove(pkg_name);
     if let Err(e) = db.save() {
         eprintln!("{} Failed to update installed DB: {}", "[ror]".red().bold(), e);
-        failed = true;
     } else {
         println!("{} Package '{}' removed from database.", "[ror]".green(), pkg_name);
     }
 
-    if failed {
-        eprintln!("{} Some errors occurred during removal.", "[ror]".red().bold());
+    if !success {
+        eprintln!("{} Some errors occurred while removing '{}'.", "[ror]".red().bold(), pkg_name);
     } else {
         println!("{} Package '{}' successfully removed.", "[ror]".green().bold(), pkg_name);
     }

@@ -40,14 +40,12 @@ impl DependencyGraph {
                 in_degree.entry(child.clone()).or_insert(0);
             }
         }
-
         let mut levels = Vec::new();
         let mut queue: VecDeque<String> = in_degree.iter()
-            .filter(|(_, &deg)| deg == 0)
+            .filter(|&(_, &deg)| deg == 0)
             .map(|(pkg, _)| pkg.clone())
             .collect();
         debug!("compute_levels: initial queue: {:?}", queue);
-
         while !queue.is_empty() {
             let level_pkgs: Vec<String> = queue.drain(..).collect();
             debug!("compute_levels: level {}: {:?}", levels.len(), level_pkgs);
@@ -65,12 +63,10 @@ impl DependencyGraph {
                 }
             }
         }
-
         let cyclic: Vec<_> = in_degree.iter()
-            .filter(|(_, &d)| d > 0)
+            .filter(|&(_, &d)| d > 0)
             .map(|(name, _)| name.as_str())
             .collect();
-
         if !cyclic.is_empty() {
             eprintln!(
                 "{} Warning: cycle detected among packages, they will be installed in arbitrary order",
@@ -78,7 +74,6 @@ impl DependencyGraph {
             );
             debug!("compute_levels: circular dependency among: {:?}", cyclic);
         }
-
         debug!("compute_levels: levels count = {}", levels.len());
         levels
     }
@@ -88,7 +83,6 @@ fn collect_required_packages(packages: &[String], installed_db: &InstalledDB) ->
     debug!("collect_required_packages: start with packages {:?}", packages);
     let mut required = HashSet::new();
     let mut stack: Vec<String> = packages.iter().cloned().collect();
-
     while let Some(pkg_name) = stack.pop() {
         debug!("collect_required_packages: processing {}", pkg_name);
         if installed_db.is_installed(&pkg_name) || required.contains(&pkg_name) {
@@ -96,7 +90,6 @@ fn collect_required_packages(packages: &[String], installed_db: &InstalledDB) ->
             continue;
         }
         required.insert(pkg_name.clone());
-
         let pkg = match load_package(&pkg_name) {
             Some(p) => p,
             None => {
@@ -104,7 +97,6 @@ fn collect_required_packages(packages: &[String], installed_db: &InstalledDB) ->
                 return Err(format!("Package '{}' not found", pkg_name));
             }
         };
-
         for dep in &pkg.depends {
             match dep {
                 Dependency::Single(name) => {
@@ -115,22 +107,20 @@ fn collect_required_packages(packages: &[String], installed_db: &InstalledDB) ->
                 }
                 Dependency::Any(alternatives) => {
                     debug!("collect_required_packages: any dependency {:?}", alternatives);
+
                     let installed_alt = alternatives.iter().find(|alt| installed_db.is_installed(*alt));
                     if installed_alt.is_some() {
                         debug!("collect_required_packages: an alternative already installed, skipping");
                         continue;
                     }
-                    let chosen = alternatives.iter()
-                        .find(|alt| required.contains(*alt))
-                        .cloned()
-                        .or_else(|| alternatives.first().cloned())
-                        .ok_or_else(|| {
-                            debug!("collect_required_packages: empty alternative list");
-                            format!("Empty alternative list in package {}", pkg_name)
-                        })?;
-                    debug!("collect_required_packages: chosen alternative {}", chosen);
-                    if !required.contains(&chosen) {
-                        stack.push(chosen);
+
+                    if let Some(primary_dep) = alternatives.first().cloned() {
+                        debug!("collect_required_packages: chosen primary alternative {}", primary_dep);
+                        if !required.contains(&primary_dep) {
+                            stack.push(primary_dep);
+                        }
+                    } else {
+                        return Err(format!("Empty alternative list in package {}", pkg_name));
                     }
                 }
             }
@@ -196,7 +186,6 @@ fn check_conflicts(required: &HashSet<String>, installed_db: &InstalledDB) -> Re
         };
         pkg_map.insert(pkg_name.clone(), pkg);
     }
-
     for (name, pkg) in &pkg_map {
         for conflict in &pkg.conflicts {
             if installed_db.is_installed(conflict) {
@@ -205,7 +194,6 @@ fn check_conflicts(required: &HashSet<String>, installed_db: &InstalledDB) -> Re
             }
         }
     }
-
     let names: Vec<_> = pkg_map.keys().cloned().collect();
     for i in 0..names.len() {
         for j in i+1..names.len() {
@@ -258,31 +246,23 @@ pub fn install_packages_parallel(packages: &[String], cfg: Arc<Config>) -> Resul
         debug!("install_packages_parallel: no packages required");
         return Ok(());
     }
-
     check_conflicts(&required, &installed_db)?;
-
     let graph = build_graph(&required, &installed_db)?;
     let mut levels = graph.compute_levels();
-
     if levels.is_empty() && !required.is_empty() {
         debug!("install_packages_parallel: no dependencies, creating single level");
         levels.push(required.iter().cloned().collect());
     }
-
     debug!("install_packages_parallel: levels: {:?}", levels);
-
     let total_pkgs: usize = levels.iter().map(|l| l.len()).sum();
     let mut installed_count = 0usize;
-
     println!(
         "{} Installing {} package(s) across {} level(s)",
         "[ror]".blue().bold(),
         total_pkgs,
         levels.len()
     );
-
     let db_mutex = Arc::new(Mutex::new(InstalledDB::load()));
-
     for (level_idx, level_pkgs) in levels.into_iter().enumerate() {
         println!(
             "{} Level {}: {} package(s)",
@@ -291,10 +271,8 @@ pub fn install_packages_parallel(packages: &[String], cfg: Arc<Config>) -> Resul
             level_pkgs.len()
         );
         debug!("install_packages_parallel: starting level {} with {:?}", level_idx, level_pkgs);
-
         let level_total = level_pkgs.len();
         let mut handles = Vec::new();
-
         for pkg in level_pkgs {
             let pkg_name = pkg.clone();
             let cfg = Arc::clone(&cfg);
@@ -304,10 +282,8 @@ pub fn install_packages_parallel(packages: &[String], cfg: Arc<Config>) -> Resul
             });
             handles.push((pkg, handle));
         }
-
         let mut errors = Vec::new();
         let mut level_done = 0usize;
-
         for (pkg_name, handle) in handles {
             match handle.join() {
                 Ok(Ok(())) => {
@@ -334,14 +310,12 @@ pub fn install_packages_parallel(packages: &[String], cfg: Arc<Config>) -> Resul
             }
         }
         eprintln!();
-
         if !errors.is_empty() {
             eprintln!("{} Errors during level {}: {:?}", "[ror]".red().bold(), level_idx, errors);
             debug!("install_packages_parallel: level {} failed with {} errors", level_idx, errors.len());
             return Err(format!("Installation failed at level {}", level_idx));
         }
     }
-
     println!("{} All packages installed successfully.", "[ror]".green().bold());
     debug!("install_packages_parallel: completed successfully");
     Ok(())
