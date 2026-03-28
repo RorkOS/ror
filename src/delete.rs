@@ -83,7 +83,7 @@ pub fn check_critical_install(pkg_name: &str, db: &InstalledDB) -> Result<(), St
     Ok(())
 }
 
-pub fn remove_package_files_only(pkg_name: &str, files: &[String]) -> bool {
+pub fn remove_package_files_only(_pkg_name: &str, files: &[String]) -> bool {
     let mut failed = false;
 
     for rel_path in files {
