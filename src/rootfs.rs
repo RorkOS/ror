@@ -7,12 +7,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use colored::Colorize;
 use serde::Serialize;
+use serde_json;
 use crate::config;
 use crate::group::Group;
 use crate::progress::ProgressBar;
+use chrono::Local;
 use crate::install::{
     Dependency, load_package, download_and_verify,
     extract_native, install_files_with_root, select_binary_for_arch,
+    InstalledDB, InstalledPackage,
 };
 
 struct DownloadTask {
@@ -485,6 +488,34 @@ fn run_all_install_steps(
     Ok(())
 }
 
+fn write_installed_json(
+    target_dir: &Path,
+    packages: &[String],
+    files_map: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let mut db = InstalledDB::default();
+    let now = Local::now().to_rfc3339();
+    for name in packages {
+        if let Some(pkg) = load_package(name) {
+            let files = files_map.get(name).cloned().unwrap_or_default();
+            db.packages.insert(name.clone(), InstalledPackage {
+                name: pkg.name,
+                version: pkg.version,
+                files,
+                installed_at: now.clone(),
+            });
+        }
+    }
+    let json = serde_json::to_string_pretty(&db)
+        .map_err(|e| format!("Failed to serialize installed.json: {}", e))?;
+    let out_dir = target_dir.join("etc/ror");
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Failed to create etc/ror: {}", e))?;
+    fs::write(out_dir.join("installed.json"), json)
+        .map_err(|e| format!("Failed to write installed.json: {}", e))?;
+    Ok(())
+}
+
 pub fn build_rootfs(
     group_name: &str,
     target_dir: &Path,
@@ -541,6 +572,7 @@ pub fn build_rootfs(
 
     println!("\n{} Phase 1c: Installing files...", ">>>".cyan().bold());
     let mut installing: HashSet<String> = HashSet::new();
+    let mut installed_files_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut pb = ProgressBar::new(all_packages.len().max(1), "Installing...");
 
     for pkg_name in &all_packages {
@@ -554,7 +586,8 @@ pub fn build_rootfs(
             .ok_or_else(|| format!("Archive for '{}' was not downloaded", pkg_name))?;
 
         pb.inc(&format!("Installing {}", pkg_name));
-        install_from_archive(pkg_name, archive_path, target_dir, &binary.files)?;
+        let files = install_from_archive(pkg_name, archive_path, target_dir, &binary.files)?;
+        installed_files_map.insert(pkg_name.clone(), files);
         installing.insert(pkg_name.clone());
     }
     pb.finish(&format!("{} packages installed", installing.len()));
@@ -562,6 +595,10 @@ pub fn build_rootfs(
     println!("\n{} Writing listinstalled.yaml...", ">>>".cyan());
     write_listinstalled(target_dir, &all_packages)?;
     println!("{} listinstalled.yaml written to var/ror/", ">>>".green());
+
+    println!("{} Writing installed.json...", ">>>".cyan());
+    write_installed_json(target_dir, &all_packages, &installed_files_map)?;
+    println!("{} installed.json written to etc/ror/", ">>>".green());
 
     if run_ldconfig {
         println!("{} Running ldconfig...", ">>>".cyan());

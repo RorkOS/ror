@@ -73,13 +73,14 @@ pub fn list_groups() {
 
     println!("{} Available package groups:", "[ror]".blue().bold());
     if let Ok(entries) = std::fs::read_dir(groups_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".yaml") {
-                    let group_name = name.trim_end_matches(".yaml");
-                    println!("  {}", group_name.green());
-                }
-            }
+        let mut groups: Vec<String> = entries.flatten()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .filter(|n| n.ends_with(".yaml"))
+            .map(|n| n.trim_end_matches(".yaml").to_string())
+            .collect();
+        groups.sort();
+        for (i, group_name) in groups.iter().enumerate() {
+            println!("  {}. {}", i + 1, group_name.green());
         }
     }
 }

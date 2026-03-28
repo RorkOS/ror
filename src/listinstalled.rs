@@ -11,21 +11,20 @@ pub fn print_installed() {
     }
 
     println!("{} Installed packages:", "[ror]".blue().bold());
-    println!("{:-<60}", "");
-    println!("{:<20} {:<15} {:<10}", "Name", "Version", "Type");
-    println!("{:-<60}", "");
+    println!("{:-<45}", "");
+    println!("{:<20} {:<15}", "Name", "Version");
+    println!("{:-<45}", "");
 
     let mut sorted: Vec<_> = packages.values().collect();
     sorted.sort_by_key(|p| &p.name);
 
     for pkg in sorted {
         println!(
-            "{:<20} {:<15} {:<10}",
+            "{:<20} {:<15}",
             pkg.name.green(),
             pkg.version.cyan(),
-            pkg.build_type.yellow()
         );
     }
-    println!("{:-<60}", "");
+    println!("{:-<45}", "");
     println!("{} Total: {} packages", ">>>".green(), packages.len());
 }

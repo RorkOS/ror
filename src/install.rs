@@ -42,8 +42,6 @@ pub struct Package {
     #[serde(default)]
     pub install_steps: String,
     #[serde(default)]
-    pub delete_steps: String,
-    #[serde(default)]
     pub depends: Vec<Dependency>,
     #[serde(default)]
     pub conflicts: Vec<String>,
@@ -76,7 +74,6 @@ fn default_install_prefix() -> String {
 pub struct InstalledPackage {
     pub name: String,
     pub version: String,
-    pub build_type: String,
     pub files: Vec<String>,
     pub installed_at: String,
 }
@@ -335,7 +332,6 @@ pub fn install_package_with_result(pkg_name: &str, cfg: &config::Config) -> Resu
     Ok(InstalledPackage {
         name: pkg.name.clone(),
         version: pkg.version.clone(),
-        build_type: "binary".to_string(),
         files: all_installed_files,
         installed_at: Local::now().to_rfc3339(),
     })

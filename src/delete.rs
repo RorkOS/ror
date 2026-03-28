@@ -1,8 +1,7 @@
 use std::fs;
 use std::path::Path;
 use colored::Colorize;
-use std::process::Command;
-use crate::install::{load_package, InstalledDB, Package, find_package_file};
+use crate::install::{load_package, InstalledDB};
 
 const CRITICAL_ROLES: &[&str] = &["init-system", "sh"];
 
@@ -95,25 +94,6 @@ pub fn remove_package_files_only(pkg_name: &str, files: &[String]) -> bool {
                 failed = true;
             } else {
                 println!("{} Removed {}", ">>>".green(), full_path.display());
-            }
-        }
-    }
-
-    if let Some(pkg_path) = find_package_file(pkg_name) {
-        if let Ok(content) = fs::read_to_string(pkg_path) {
-            if let Ok(pkg) = serde_yaml::from_str::<Package>(&content) {
-                if !pkg.delete_steps.trim().is_empty() {
-                    println!("{} Running delete steps for '{}'...", ">>>".yellow(), pkg_name);
-                    let status = Command::new("sh")
-                        .arg("-c")
-                        .arg(&pkg.delete_steps)
-                        .status()
-                        .expect("Failed to execute delete steps");
-                    if !status.success() {
-                        eprintln!("{} Delete steps for '{}' failed", "[ror]".red().bold(), pkg_name);
-                        failed = true;
-                    }
-                }
             }
         }
     }
