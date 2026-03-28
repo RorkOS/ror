@@ -33,6 +33,7 @@ Config is located at `/var/ror/ror.conf`:
 [global]
 ignore_speed = false
 strict_gpg = false
+parallel_downloads = 4
 
 [repositories.rorkos]
 url = "https:
