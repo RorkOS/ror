@@ -76,8 +76,6 @@ binaries:
 install_steps: |
   update-alternatives --install /usr/bin/vi vi /usr/bin/vim 100
 
-delete_steps: |
-  update-alternatives --remove vi /usr/bin/vim
 ```
 
 ---
